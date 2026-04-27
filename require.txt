@@ -1,0 +1,6 @@
+pylint
+flake8
+bandit
+radon
+vulture
+mypy
