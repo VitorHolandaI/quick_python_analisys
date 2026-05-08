@@ -25,16 +25,18 @@ Requirements:
 
 import argparse
 import json
-import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 import textwrap
+from datetime import datetime, timezone
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from html import escape as html_escape
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -85,6 +87,7 @@ class Issue:
 @dataclass
 class Report:
     path: str
+    analyzed_files: List[str] = field(default_factory=list)
     files_analyzed: int = 0
     total_lines: int = 0
     code_lines: int = 0
@@ -104,6 +107,7 @@ class Report:
     tool_errors: Dict[str, str] = field(default_factory=dict)
     tool_outputs: List[dict] = field(default_factory=list)
     radon_details: List[dict] = field(default_factory=list)
+    tool_scores: Dict[str, dict] = field(default_factory=dict)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -117,6 +121,10 @@ SKIP_DIRS = {
 }
 
 COMMAND_LOG: List[dict] = []
+PROJECT_ROOT = Path(__file__).resolve().parent
+SKIP_PROJECT_FILES = {
+    PROJECT_ROOT / "pyquality.py",
+}
 
 TOOL_DETAILS = [
     (
@@ -156,17 +164,64 @@ def find_python_files(path: str) -> List[str]:
     p = Path(path)
     if p.is_file() and p.suffix == ".py":
         return [str(p)]
-    files = []
+    files: List[str] = []
     if p.is_dir():
         for f in sorted(p.rglob("*.py")):
-            if not any(d in f.parts for d in SKIP_DIRS):
-                files.append(str(f))
+            if any(d in f.parts for d in SKIP_DIRS):
+                continue
+            if f.resolve() in SKIP_PROJECT_FILES:
+                continue
+            files.append(str(f))
     return files
+
+
+def resolve_tool_path(tool_name: str) -> str:
+    resolved = shutil.which(tool_name)
+    if resolved:
+        return resolved
+
+    bin_dirs = [Path(sys.executable).resolve().parent]
+    project_root = Path(__file__).resolve().parent
+    venv_dir_name = "Scripts" if os.name == "nt" else "bin"
+    bin_dirs.append(project_root / ".venv" / venv_dir_name)
+
+    for bin_dir in bin_dirs:
+        candidate = bin_dir / tool_name
+        if candidate.exists():
+            return str(candidate)
+        if os.name == "nt":
+            exe_candidate = candidate.with_suffix(".exe")
+            if exe_candidate.exists():
+                return str(exe_candidate)
+
+    return tool_name
+
+
+def default_issue_file(files: Sequence[str]) -> str:
+    return files[0] if files else ""
+
+
+def as_str(value: object, default: str = "") -> str:
+    if value is None:
+        return default
+    return str(value)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TOOL RUNNERS
 # ═══════════════════════════════════════════════════════════════════════════════
+
+def max_parallel_jobs() -> int:
+    override = os.environ.get("PYQUALITY_MAX_JOBS")
+    if override:
+        try:
+            return max(1, int(override))
+        except ValueError:
+            pass
+
+    cpu_count = os.cpu_count() or 1
+    return max(1, cpu_count // 3)
+
 
 def run_cmd(cmd: List[str], timeout: int = 120) -> Tuple[str, str, int]:
     try:
@@ -200,17 +255,21 @@ def run_cmd(cmd: List[str], timeout: int = 120) -> Tuple[str, str, int]:
 
 # ── PYLINT ──────────────────────────────────────────────────────────────────
 
-def run_pylint(path: str) -> Tuple[List[Issue], Optional[float], Optional[str]]:
+def run_pylint(files: List[str]) -> Tuple[List[Issue], Optional[float], Optional[str]]:
     cmd = [
-        "pylint", path,
+        resolve_tool_path("pylint"),
         "--output-format=json2",
         "--disable=C0114,C0115,C0116",
         "--max-line-length=120",
-        "--jobs=0",
+        f"--jobs={max_parallel_jobs()}",
+        *files,
     ]
     stdout, stderr, rc = run_cmd(cmd)
-    issues = []
+    issues: List[Issue] = []
     score = None
+
+    if rc == -1:
+        return issues, score, stderr or "Failed to run pylint"
 
     for line in stderr.splitlines():
         m = re.search(r"rated at (-?[\d.]+)/10", line)
@@ -224,6 +283,12 @@ def run_pylint(path: str) -> Tuple[List[Issue], Optional[float], Optional[str]]:
         data = json.loads(stdout)
     except json.JSONDecodeError:
         return issues, score, "Failed to parse pylint output"
+
+    if isinstance(data, dict):
+        stats = data.get("statistics", {})
+        json_score = stats.get("score")
+        if isinstance(json_score, (int, float)):
+            score = float(json_score)
 
     severity_map = {
         "fatal": "CRITICAL", "error": "HIGH", "warning": "MEDIUM",
@@ -239,14 +304,15 @@ def run_pylint(path: str) -> Tuple[List[Issue], Optional[float], Optional[str]]:
     for msg in messages:
         if isinstance(msg, dict):
             msg_type = msg.get("type", "warning")
+            message_id = msg.get("message-id") or msg.get("messageId") or "?"
             issues.append(Issue(
                 tool="pylint",
-                file=msg.get("path", path),
-                line=msg.get("line", 0),
-                col=msg.get("column", 0),
+                file=as_str(msg.get("path"), default_issue_file(files)),
+                line=int(msg.get("line", 0) or 0),
+                col=int(msg.get("column", 0) or 0),
                 severity=severity_map.get(msg_type, "MEDIUM"),
-                code=msg.get("message-id", msg.get("messageId", "?")),
-                message=msg.get("message", ""),
+                code=as_str(message_id, "?"),
+                message=as_str(msg.get("message")),
                 category=category_map.get(msg_type, "Bug"),
             ))
 
@@ -255,14 +321,18 @@ def run_pylint(path: str) -> Tuple[List[Issue], Optional[float], Optional[str]]:
 
 # ── FLAKE8 ──────────────────────────────────────────────────────────────────
 
-def run_flake8(path: str) -> Tuple[List[Issue], Optional[str]]:
+def run_flake8(files: List[str]) -> Tuple[List[Issue], Optional[str]]:
     cmd = [
-        "flake8", path,
+        resolve_tool_path("flake8"),
         "--max-line-length=120",
         "--format=%(path)s:%(row)d:%(col)d:%(code)s:%(text)s",
+        *files,
     ]
     stdout, stderr, rc = run_cmd(cmd)
-    issues = []
+    issues: List[Issue] = []
+
+    if rc == -1:
+        return issues, stderr or "Failed to run flake8"
 
     for line in stdout.splitlines():
         m = re.match(r"^(.+?):(\d+):(\d+):([A-Z]\d+):(.+)$", line)
@@ -288,10 +358,13 @@ def run_flake8(path: str) -> Tuple[List[Issue], Optional[str]]:
 
 # ── BANDIT ──────────────────────────────────────────────────────────────────
 
-def run_bandit(path: str) -> Tuple[List[Issue], Optional[str]]:
-    cmd = ["bandit", "-r", path, "-f", "json", "-q"]
+def run_bandit(files: List[str]) -> Tuple[List[Issue], Optional[str]]:
+    cmd = [resolve_tool_path("bandit"), "-f", "json", "-q", *files]
     stdout, stderr, rc = run_cmd(cmd)
-    issues = []
+    issues: List[Issue] = []
+
+    if rc == -1:
+        return issues, stderr or "Failed to run bandit"
 
     if not stdout.strip():
         return issues, None
@@ -320,11 +393,14 @@ def run_bandit(path: str) -> Tuple[List[Issue], Optional[str]]:
 
 # ── RADON ───────────────────────────────────────────────────────────────────
 
-def run_radon_cc(path: str) -> Tuple[List[Issue], List[dict], Optional[str]]:
-    cmd = ["radon", "cc", path, "-s", "-j"]
+def run_radon_cc(files: List[str]) -> Tuple[List[Issue], List[dict], Optional[str]]:
+    cmd = [resolve_tool_path("radon"), "cc", "-s", "-j", *files]
     stdout, stderr, rc = run_cmd(cmd)
-    issues = []
-    details = []
+    issues: List[Issue] = []
+    details: List[dict] = []
+
+    if rc == -1:
+        return issues, details, stderr or "Failed to run radon cc"
 
     if not stdout.strip():
         return issues, details, None
@@ -362,9 +438,12 @@ def run_radon_cc(path: str) -> Tuple[List[Issue], List[dict], Optional[str]]:
     return issues, details, None
 
 
-def run_radon_mi(path: str) -> Tuple[float, Optional[str]]:
-    cmd = ["radon", "mi", path, "-s", "-j"]
+def run_radon_mi(files: List[str]) -> Tuple[float, Optional[str]]:
+    cmd = [resolve_tool_path("radon"), "mi", "-s", "-j", *files]
     stdout, stderr, rc = run_cmd(cmd)
+
+    if rc == -1:
+        return 100.0, stderr or "Failed to run radon mi"
 
     if not stdout.strip():
         return 100.0, None
@@ -386,10 +465,13 @@ def run_radon_mi(path: str) -> Tuple[float, Optional[str]]:
     return 100.0, None
 
 
-def run_radon_raw(path: str) -> Tuple[Dict[str, int], Optional[str]]:
-    cmd = ["radon", "raw", path, "-s", "-j"]
+def run_radon_raw(files: List[str]) -> Tuple[Dict[str, int], Optional[str]]:
+    cmd = [resolve_tool_path("radon"), "raw", "-s", "-j", *files]
     stdout, stderr, rc = run_cmd(cmd)
     totals = {"loc": 0, "sloc": 0, "comments": 0, "blank": 0, "multi": 0}
+
+    if rc == -1:
+        return totals, stderr or "Failed to run radon raw"
 
     if not stdout.strip():
         return totals, None
@@ -412,10 +494,13 @@ def run_radon_raw(path: str) -> Tuple[Dict[str, int], Optional[str]]:
 
 # ── VULTURE ─────────────────────────────────────────────────────────────────
 
-def run_vulture(path: str) -> Tuple[List[Issue], Optional[str]]:
-    cmd = ["vulture", path, "--min-confidence=80"]
+def run_vulture(files: List[str]) -> Tuple[List[Issue], Optional[str]]:
+    cmd = [resolve_tool_path("vulture"), "--min-confidence=80", *files]
     stdout, stderr, rc = run_cmd(cmd)
-    issues = []
+    issues: List[Issue] = []
+
+    if rc == -1:
+        return issues, stderr or "Failed to run vulture"
 
     for line in stdout.splitlines():
         m = re.match(r"^(.+?):(\d+): (.+?)(\((\d+)% confidence\))?$", line.strip())
@@ -437,16 +522,20 @@ def run_vulture(path: str) -> Tuple[List[Issue], Optional[str]]:
 
 # ── MYPY ────────────────────────────────────────────────────────────────────
 
-def run_mypy(path: str) -> Tuple[List[Issue], Optional[str]]:
+def run_mypy(files: List[str]) -> Tuple[List[Issue], Optional[str]]:
     cmd = [
-        "mypy", path,
+        resolve_tool_path("mypy"),
         "--ignore-missing-imports",
         "--no-error-summary",
         "--show-column-numbers",
         "--no-color-output",
+        *files,
     ]
     stdout, stderr, rc = run_cmd(cmd, timeout=180)
-    issues = []
+    issues: List[Issue] = []
+
+    if rc == -1:
+        return issues, stderr or "Failed to run mypy"
 
     for line in stdout.splitlines():
         m = re.match(r"^(.+?):(\d+):(\d+): (error|warning|note): (.+)$", line.strip())
@@ -487,58 +576,170 @@ def score_maintainability_index(mi: float) -> float:
     return max(0, mi * 3)
 
 
-def compute_quality_score(report: Report) -> float:
-    """
-    Weighted 0-100 score:
-      Pylint (30%) | Issue density (25%) | Maintainability (20%)
-      Complexity (10%) | Security (10%) | Dead code (5%)
-    """
-    scores = {}
+def clamp_score(value: float) -> float:
+    return round(max(0.0, min(100.0, value)), 1)
 
-    # Pylint component (0-100)
-    if report.pylint_score is not None:
-        scores["pylint"] = max(0, min(100, (report.pylint_score + 10) * 5))
-    else:
-        scores["pylint"] = 50
 
-    # Issue density (0-100)
-    loc = max(report.code_lines, 1)
-    total_weight = sum(i.severity_weight for i in report.issues)
-    density_penalty = (total_weight / (loc / 100)) * 2
-    scores["issues"] = max(0, 100 - density_penalty)
-
-    # Maintainability score derived from Radon's MI bands.
-    scores["maintainability"] = score_maintainability_index(
-        report.maintainability_index
-    )
-
-    # Complexity (0-100)
-    cc = report.avg_complexity
-    if cc <= 5:
-        scores["complexity"] = 100
-    elif cc <= 10:
-        scores["complexity"] = 100 - (cc - 5) * 8
-    elif cc <= 20:
-        scores["complexity"] = 60 - (cc - 10) * 4
-    else:
-        scores["complexity"] = max(0, 20 - (cc - 20) * 2)
-
-    # Security (0-100)
-    sec_penalty = sum(
-        i.severity_weight for i in report.issues if i.category == "Security"
-    ) * 5
-    scores["security"] = max(0, 100 - sec_penalty)
-
-    # Dead code (0-100)
-    scores["dead_code"] = max(0, 100 - report.dead_code_count * 2)
-
-    weights = {
-        "pylint": 0.30, "issues": 0.25, "maintainability": 0.20,
-        "complexity": 0.10, "security": 0.10, "dead_code": 0.05,
+def make_tool_score(
+    score: Optional[float],
+    source: str,
+    *,
+    raw_value: Optional[float] = None,
+    raw_scale: Optional[str] = None,
+    details: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    normalized_score = None if score is None else clamp_score(score)
+    return {
+        "score": normalized_score,
+        "grade": grade_from_score(normalized_score) if normalized_score is not None else None,
+        "source": source,
+        "raw_value": raw_value,
+        "raw_scale": raw_scale,
+        "details": details or {},
     }
 
-    final = sum(scores[k] * weights[k] for k in weights)
-    return round(max(0, min(100, final)), 1)
+
+def count_issue_severities(issues: List[Issue]) -> Dict[str, int]:
+    return dict(Counter(issue.severity for issue in issues))
+
+
+def penalty_score(issues: List[Issue], penalties: Dict[str, int]) -> float:
+    total_penalty = sum(penalties.get(issue.severity, 0) for issue in issues)
+    return clamp_score(100 - total_penalty)
+
+
+def score_complexity_metric(avg_complexity: float) -> float:
+    if avg_complexity <= 5:
+        return 100.0
+    if avg_complexity <= 10:
+        return 100 - (avg_complexity - 5) * 4
+    if avg_complexity <= 20:
+        return 80 - (avg_complexity - 10) * 4
+    if avg_complexity <= 30:
+        return 40 - (avg_complexity - 20) * 3
+    return 0.0
+
+
+def build_pylint_tool_score(issues: List[Issue], pylint_score: Optional[float]) -> Dict[str, object]:
+    severities = count_issue_severities(issues)
+    return make_tool_score(
+        None if pylint_score is None else pylint_score * 10,
+        "Score nativo do relatorio do pylint.",
+        raw_value=pylint_score,
+        raw_scale="/10",
+        details={
+            "findings": len(issues),
+            "severity_counts": severities,
+        },
+    )
+
+
+def build_penalty_tool_score(
+    issues: List[Issue],
+    penalties: Dict[str, int],
+    source: str,
+) -> Dict[str, object]:
+    severities = count_issue_severities(issues)
+    return make_tool_score(
+        penalty_score(issues, penalties),
+        source,
+        details={
+            "findings": len(issues),
+            "severity_counts": severities,
+        },
+    )
+
+
+def build_radon_tool_score(
+    maintainability_index: Optional[float],
+    avg_complexity: Optional[float],
+    max_complexity: Optional[float],
+    block_count: Optional[int],
+) -> Dict[str, object]:
+    mi_score = clamp_score(maintainability_index if maintainability_index is not None else 100.0)
+    cc_score = clamp_score(score_complexity_metric(avg_complexity or 0.0))
+    return make_tool_score(
+        (mi_score + cc_score) / 2,
+        "Media entre maintainability index e complexidade reportados pelo radon.",
+        details={
+            "maintainability_index": maintainability_index,
+            "avg_complexity": avg_complexity,
+            "max_complexity": max_complexity,
+            "blocks_analyzed": block_count or 0,
+            "mi_score": mi_score,
+            "complexity_score": cc_score,
+        },
+    )
+
+
+PENALTY_TOOL_CONFIGS = {
+    "flake8": (
+        {"HIGH": 12, "MEDIUM": 6, "LOW": 2, "INFO": 1},
+        "Score derivado apenas das ocorrencias reportadas pelo flake8.",
+    ),
+    "bandit": (
+        {"CRITICAL": 35, "HIGH": 20, "MEDIUM": 8, "LOW": 3},
+        "Score derivado apenas das vulnerabilidades reportadas pelo bandit.",
+    ),
+    "vulture": (
+        {"MEDIUM": 8, "LOW": 4},
+        "Score derivado apenas dos itens de codigo morto reportados pelo vulture.",
+    ),
+    "mypy": (
+        {"HIGH": 20, "MEDIUM": 8, "LOW": 2},
+        "Score derivado apenas dos erros e avisos reportados pelo mypy.",
+    ),
+}
+
+
+def compute_tool_score_map(
+    name: str,
+    *,
+    issues: Optional[List[Issue]] = None,
+    pylint_score: Optional[float] = None,
+    maintainability_index: Optional[float] = None,
+    avg_complexity: Optional[float] = None,
+    max_complexity: Optional[float] = None,
+    block_count: Optional[int] = None,
+) -> Dict[str, object]:
+    issues = issues or []
+    if name == "pylint":
+        return build_pylint_tool_score(issues, pylint_score)
+
+    if name == "radon":
+        return build_radon_tool_score(
+            maintainability_index,
+            avg_complexity,
+            max_complexity,
+            block_count,
+        )
+
+    penalty_config = PENALTY_TOOL_CONFIGS.get(name)
+    if penalty_config:
+        penalties, source = penalty_config
+        return build_penalty_tool_score(issues, penalties, source)
+
+    return make_tool_score(None, "Ferramenta sem score configurado.")
+
+
+def unavailable_tool_score(error_message: str) -> Dict[str, object]:
+    return make_tool_score(
+        None,
+        error_message,
+        details={"error": error_message},
+    )
+
+
+def compute_quality_score(report: Report) -> float:
+    """Average the per-tool scores generated from each tool's own report."""
+    scores = [
+        info["score"]
+        for info in report.tool_scores.values()
+        if info.get("score") is not None
+    ]
+    if not scores:
+        return 0.0
+    return round(sum(scores) / len(scores), 1)
 
 
 def grade_from_score(score: float) -> str:
@@ -553,55 +754,80 @@ def grade_from_score(score: float) -> str:
 # ANALYSIS ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def analyze(path: str, skip_mypy: bool = False) -> Report:
+def analyze(path: str, skip_mypy: bool = False, show_progress: bool = True) -> Report:
     COMMAND_LOG.clear()
     report = Report(path=path)
     py_files = find_python_files(path)
+    report.analyzed_files = list(py_files)
     report.files_analyzed = len(py_files)
 
     if not py_files:
         print(c(RED, f"Error: No Python files found in '{path}'"))
         sys.exit(1)
 
-    print(c(DIM, f"  Scanning {report.files_analyzed} file(s)...\n"))
+    if show_progress:
+        print(c(DIM, f"  Scanning {report.files_analyzed} file(s)...\n"))
 
     # Run all tools
     steps = [(name, summary.lower()) for name, summary, _ in TOOL_DETAILS]
 
     for i, (name, desc) in enumerate(steps, 1):
         if name == "mypy" and skip_mypy:
-            print(c(DIM, f"  [{i}/{len(steps)}] {name:<8} — skipped"))
+            report.tool_scores[name] = make_tool_score(
+                None,
+                "Ferramenta pulada por --skip-mypy.",
+                details={"skipped": True},
+            )
+            if show_progress:
+                print(c(DIM, f"  [{i}/{len(steps)}] {name:<8} — skipped"))
             continue
-        print(c(DIM, f"  [{i}/{len(steps)}] {name:<8} — {desc}..."))
+        if show_progress:
+            print(c(DIM, f"  [{i}/{len(steps)}] {name:<8} — {desc}..."))
 
         if name == "pylint":
-            issues, score, err = run_pylint(path)
+            issues, score, err = run_pylint(py_files)
             report.issues.extend(issues)
             report.pylint_score = score
+            if err:
+                report.tool_scores[name] = unavailable_tool_score(err)
+            else:
+                report.tool_scores[name] = compute_tool_score_map(
+                    name,
+                    issues=issues,
+                    pylint_score=score,
+                )
             if err: report.tool_errors[name] = err
 
         elif name == "flake8":
-            issues, err = run_flake8(path)
+            issues, err = run_flake8(py_files)
             report.issues.extend(issues)
+            if err:
+                report.tool_scores[name] = unavailable_tool_score(err)
+            else:
+                report.tool_scores[name] = compute_tool_score_map(name, issues=issues)
             if err: report.tool_errors[name] = err
 
         elif name == "bandit":
-            issues, err = run_bandit(path)
+            issues, err = run_bandit(py_files)
             report.issues.extend(issues)
             report.security_issues = len(issues)
+            if err:
+                report.tool_scores[name] = unavailable_tool_score(err)
+            else:
+                report.tool_scores[name] = compute_tool_score_map(name, issues=issues)
             if err: report.tool_errors[name] = err
 
         elif name == "radon":
-            cc_issues, cc_details, err = run_radon_cc(path)
+            cc_issues, cc_details, err = run_radon_cc(py_files)
             report.issues.extend(cc_issues)
             report.radon_details = cc_details
             if err: report.tool_errors["radon-cc"] = err
 
-            mi, err = run_radon_mi(path)
+            mi, err = run_radon_mi(py_files)
             report.maintainability_index = mi
             if err: report.tool_errors["radon-mi"] = err
 
-            raw, err = run_radon_raw(path)
+            raw, err = run_radon_raw(py_files)
             report.total_lines = raw["loc"]
             report.code_lines = raw["sloc"]
             report.comment_lines = raw["comments"] + raw["multi"]
@@ -617,16 +843,36 @@ def analyze(path: str, skip_mypy: bool = False) -> Report:
                     f"{cc_details[mx]['file']}::{cc_details[mx]['name']}"
                 )
 
+            if err or report.tool_errors.get("radon-mi") or report.tool_errors.get("radon-raw"):
+                first_error = err or report.tool_errors.get("radon-mi") or report.tool_errors.get("radon-raw")
+                report.tool_scores[name] = unavailable_tool_score(first_error)
+            else:
+                report.tool_scores[name] = compute_tool_score_map(
+                    name,
+                    maintainability_index=report.maintainability_index,
+                    avg_complexity=report.avg_complexity,
+                    max_complexity=report.max_complexity,
+                    block_count=len(cc_details),
+                )
+
         elif name == "vulture":
-            issues, err = run_vulture(path)
+            issues, err = run_vulture(py_files)
             report.issues.extend(issues)
             report.dead_code_count = len(issues)
+            if err:
+                report.tool_scores[name] = unavailable_tool_score(err)
+            else:
+                report.tool_scores[name] = compute_tool_score_map(name, issues=issues)
             if err: report.tool_errors[name] = err
 
         elif name == "mypy":
-            issues, err = run_mypy(path)
+            issues, err = run_mypy(py_files)
             report.issues.extend(issues)
             report.type_errors = len([i for i in issues if i.severity != "INFO"])
+            if err:
+                report.tool_scores[name] = unavailable_tool_score(err)
+            else:
+                report.tool_scores[name] = compute_tool_score_map(name, issues=issues)
             if err: report.tool_errors[name] = err
 
     # Deduplicate (same file + line + message from different tools)
@@ -832,7 +1078,7 @@ def print_tool_outputs(report: Report):
 
     for item in report.tool_outputs:
         cmd = item["cmd"]
-        tool_name = cmd[0]
+        tool_name = tool_output_key(cmd)
 
         if tool_name == "pylint":
             print_tool_header("pylint", item)
@@ -843,13 +1089,13 @@ def print_tool_outputs(report: Report):
         elif tool_name == "bandit":
             print_tool_header("bandit", item)
             print_bandit_details(item)
-        elif tool_name == "radon" and len(cmd) > 1 and cmd[1] == "cc":
+        elif tool_name == "radon-cc":
             print_tool_header("radon complexity", item)
             print_radon_cc_details(item)
-        elif tool_name == "radon" and len(cmd) > 1 and cmd[1] == "mi":
+        elif tool_name == "radon-mi":
             print_tool_header("radon maintainability", item)
             print_radon_mi_details(item)
-        elif tool_name == "radon" and len(cmd) > 1 and cmd[1] == "raw":
+        elif tool_name == "radon-raw":
             print_tool_header("radon raw metrics", item)
             print_radon_raw_details(item)
         elif tool_name == "vulture":
@@ -881,6 +1127,31 @@ def print_report(report: Report, verbose: bool = False):
           f"  {c(BOLD, 'Score:')} {report.quality_score}/100")
     if report.pylint_score is not None:
         print(f"  {c(DIM, f'Pylint score: {report.pylint_score}/10')}")
+    print()
+
+    print(f"  {c(f'{BOLD}{WHITE}', '🧮 TOOL SCORES')}")
+    print(f"  {c(DIM, '─' * (W - 4))}")
+    for name, _, _ in TOOL_DETAILS:
+        info = report.tool_scores.get(name)
+        if not info:
+            continue
+
+        score = info.get("score")
+        grade = info.get("grade") or "n/a"
+        if score is None:
+            print(f"  {name:<16} n/a   {c(DIM, info.get('source', ''))}")
+            continue
+
+        raw_value = info.get("raw_value")
+        raw_scale = info.get("raw_scale") or ""
+        raw_suffix = ""
+        if raw_value is not None:
+            raw_suffix = f"  {c(DIM, f'raw: {raw_value}{raw_scale}')}"
+
+        print(
+            f"  {name:<16} {c(BOLD, f'{score:>5}/100')}  "
+            f"{c(DIM, f'grade {grade}')}{raw_suffix}"
+        )
     print()
 
     # Overview
@@ -988,11 +1259,27 @@ def print_report(report: Report, verbose: bool = False):
 # JSON OUTPUT
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def output_json(report: Report):
-    result = {
+def issue_to_dict(issue: Issue) -> Dict[str, object]:
+    return {
+        "tool": issue.tool,
+        "file": issue.file,
+        "line": issue.line,
+        "severity": issue.severity,
+        "code": issue.code,
+        "message": issue.message,
+        "category": issue.category,
+    }
+
+
+def build_report_payload(report: Report) -> Dict[str, object]:
+    return {
         "quality_score": report.quality_score,
         "grade": report.grade,
+        "path": report.path,
+        "analyzed_files": report.analyzed_files,
         "pylint_score": report.pylint_score,
+        "tool_scores": report.tool_scores,
+        "tool_errors": report.tool_errors,
         "metrics": {
             "files_analyzed": report.files_analyzed,
             "total_lines": report.total_lines,
@@ -1013,15 +1300,471 @@ def output_json(report: Report):
             "by_tool": dict(Counter(i.tool for i in report.issues)),
         },
         "tool_outputs": report.tool_outputs,
-        "issues": [
-            {
-                "tool": i.tool, "file": i.file, "line": i.line,
-                "severity": i.severity, "code": i.code,
-                "message": i.message, "category": i.category,
-            }
-            for i in report.issues
-        ],
+        "issues": [issue_to_dict(issue) for issue in report.issues],
     }
+
+
+def output_json(report: Report):
+    print(json.dumps(build_report_payload(report), indent=2))
+
+
+def tool_output_key(cmd: Sequence[str]) -> str:
+    if not cmd:
+        return "unknown"
+
+    tool_name = Path(cmd[0]).name
+    if tool_name == "radon" and len(cmd) > 1:
+        return f"{tool_name}-{cmd[1]}"
+    return tool_name
+
+
+def output_group_name(output_key: str) -> str:
+    if output_key.startswith("radon-"):
+        return "radon"
+    return output_key
+
+
+def render_score_label(score_info: Optional[dict]) -> str:
+    if not score_info or score_info.get("score") is None:
+        return "n/a"
+
+    score = score_info["score"]
+    grade = score_info.get("grade") or "n/a"
+    return f"{score}/100 ({grade})"
+
+
+def tool_issues(report: Report, tool_name: str) -> List[Issue]:
+    return [issue for issue in report.issues if issue.tool == tool_name]
+
+
+def tool_errors(report: Report, tool_name: str) -> Dict[str, str]:
+    if tool_name == "radon":
+        return {
+            name: error
+            for name, error in report.tool_errors.items()
+            if name == "radon" or name.startswith("radon-")
+        }
+    return {
+        name: error
+        for name, error in report.tool_errors.items()
+        if name == tool_name
+    }
+
+
+def render_issue_rows_html(issues: Sequence[Issue]) -> str:
+    if not issues:
+        return "<p>No findings reported.</p>"
+
+    rows = [
+        "<table>",
+        "<thead><tr><th>Severity</th><th>File</th><th>Line</th><th>Code</th><th>Message</th></tr></thead>",
+        "<tbody>",
+    ]
+    for issue in sorted(issues, key=lambda item: (item.file, item.line, item.code)):
+        rows.append(
+            "<tr>"
+            f"<td>{html_escape(issue.severity)}</td>"
+            f"<td>{html_escape(issue.file)}</td>"
+            f"<td>{issue.line}</td>"
+            f"<td>{html_escape(issue.code)}</td>"
+            f"<td>{html_escape(issue.message)}</td>"
+            "</tr>"
+        )
+    rows.extend(["</tbody>", "</table>"])
+    return "\n".join(rows)
+
+
+def render_output_sections_html(artifacts: Sequence[dict]) -> str:
+    if not artifacts:
+        return "<p>No raw command output captured.</p>"
+
+    sections = []
+    for artifact in artifacts:
+        links = []
+        if artifact.get("meta_file"):
+            links.append(f"<a href=\"../{html_escape(artifact['meta_file'])}\">meta</a>")
+        if artifact.get("stdout_file"):
+            links.append(f"<a href=\"../{html_escape(artifact['stdout_file'])}\">stdout</a>")
+        if artifact.get("stderr_file"):
+            links.append(f"<a href=\"../{html_escape(artifact['stderr_file'])}\">stderr</a>")
+        link_block = " | ".join(links) if links else "no artifact files"
+
+        section = [
+            "<section class=\"artifact\">",
+            f"<h3>{html_escape(artifact['label'])}</h3>",
+            f"<p><strong>Command:</strong> <code>{html_escape(' '.join(artifact['command']))}</code></p>",
+            f"<p><strong>Return code:</strong> {artifact['returncode']} | <strong>Files:</strong> {link_block}</p>",
+        ]
+        stdout = artifact.get("stdout", "").strip()
+        stderr = artifact.get("stderr", "").strip()
+        if stdout:
+            section.append(
+                "<details><summary>stdout</summary>"
+                f"<pre>{html_escape(artifact['stdout'])}</pre>"
+                "</details>"
+            )
+        if stderr:
+            section.append(
+                "<details><summary>stderr</summary>"
+                f"<pre>{html_escape(artifact['stderr'])}</pre>"
+                "</details>"
+            )
+        section.append("</section>")
+        sections.append("\n".join(section))
+    return "\n".join(sections)
+
+
+def render_index_markdown(report: Report, generated_at: str) -> str:
+    lines = [
+        "# PyQuality Report",
+        "",
+        f"- Generated at: `{generated_at}`",
+        f"- Target: `{report.path}`",
+        f"- Files analyzed: `{report.files_analyzed}`",
+        f"- Overall score: `{report.quality_score}/100`",
+        f"- Grade: `{report.grade}`",
+        "- Scoring notes: [scoring-heuristics.md](scoring-heuristics.md)",
+        "",
+        "## Tool Reports",
+        "",
+        "| Tool | Score | Details |",
+        "| --- | --- | --- |",
+    ]
+    for tool_name, _, _ in TOOL_DETAILS:
+        score_info = report.tool_scores.get(tool_name)
+        lines.append(
+            f"| `{tool_name}` | `{render_score_label(score_info)}` | "
+            f"[html](tools/{tool_name}.html) · [json](tools/{tool_name}.json) |"
+        )
+
+    lines.extend([
+        "",
+        "## Files",
+        "",
+    ])
+    for file_path in report.analyzed_files:
+        lines.append(f"- `{file_path}`")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_index_html(report: Report, generated_at: str) -> str:
+    rows = []
+    for tool_name, _, _ in TOOL_DETAILS:
+        score_info = report.tool_scores.get(tool_name)
+        rows.append(
+            "<tr>"
+            f"<td>{html_escape(tool_name)}</td>"
+            f"<td>{html_escape(render_score_label(score_info))}</td>"
+            f"<td><a href=\"tools/{html_escape(tool_name)}.html\">html</a> | "
+            f"<a href=\"tools/{html_escape(tool_name)}.json\">json</a></td>"
+            "</tr>"
+        )
+
+    files_html = "\n".join(
+        f"<li><code>{html_escape(file_path)}</code></li>"
+        for file_path in report.analyzed_files
+    ) or "<li><em>No files recorded.</em></li>"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>PyQuality Report</title>
+  <style>
+    body {{ font-family: sans-serif; margin: 2rem auto; max-width: 1100px; padding: 0 1rem; line-height: 1.5; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border: 1px solid #d0d7de; padding: 0.6rem; text-align: left; vertical-align: top; }}
+    code, pre {{ font-family: monospace; }}
+    pre {{ background: #f6f8fa; padding: 1rem; overflow: auto; }}
+  </style>
+</head>
+<body>
+  <h1>PyQuality Report</h1>
+  <p><strong>Generated at:</strong> <code>{html_escape(generated_at)}</code></p>
+  <p><strong>Target:</strong> <code>{html_escape(report.path)}</code></p>
+  <p><strong>Overall:</strong> {report.quality_score}/100 ({html_escape(report.grade)})</p>
+  <p><strong>Scoring notes:</strong> <a href="scoring-heuristics.md">scoring-heuristics.md</a></p>
+
+  <h2>Tool Reports</h2>
+  <table>
+    <thead><tr><th>Tool</th><th>Score</th><th>Reports</th></tr></thead>
+    <tbody>
+      {"".join(rows)}
+    </tbody>
+  </table>
+
+  <h2>Files Analyzed</h2>
+  <ul>
+    {files_html}
+  </ul>
+</body>
+</html>
+"""
+
+
+def render_tool_html(
+    tool_name: str,
+    report: Report,
+    generated_at: str,
+    artifacts: Sequence[dict],
+) -> str:
+    score_info = report.tool_scores.get(tool_name)
+    issues = tool_issues(report, tool_name)
+    errors = tool_errors(report, tool_name)
+    error_html = ""
+    if errors:
+        error_items = "".join(
+            f"<li><strong>{html_escape(name)}:</strong> {html_escape(error)}</li>"
+            for name, error in sorted(errors.items())
+        )
+        error_html = f"<h2>Tool Warnings</h2><ul>{error_items}</ul>"
+
+    source = ""
+    if score_info:
+        source = html_escape(str(score_info.get("source", "")))
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>PyQuality {html_escape(tool_name)} report</title>
+  <style>
+    body {{ font-family: sans-serif; margin: 2rem auto; max-width: 1200px; padding: 0 1rem; line-height: 1.5; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border: 1px solid #d0d7de; padding: 0.6rem; text-align: left; vertical-align: top; }}
+    code, pre {{ font-family: monospace; }}
+    pre {{ background: #f6f8fa; padding: 1rem; overflow: auto; }}
+    .artifact {{ border: 1px solid #d0d7de; padding: 1rem; margin: 1rem 0; border-radius: 6px; }}
+  </style>
+</head>
+<body>
+  <p><a href="../index.html">Back to index</a></p>
+  <h1>{html_escape(tool_name)}</h1>
+  <p><strong>Generated at:</strong> <code>{html_escape(generated_at)}</code></p>
+  <p><strong>Score:</strong> {html_escape(render_score_label(score_info))}</p>
+  <p><strong>Source:</strong> {source or "n/a"}</p>
+
+  <h2>Findings</h2>
+  {render_issue_rows_html(issues)}
+
+  {error_html}
+
+  <h2>Raw Tool Output</h2>
+  {render_output_sections_html(artifacts)}
+</body>
+</html>
+"""
+
+
+def render_scoring_heuristics_markdown() -> str:
+    return textwrap.dedent("""\
+        # PyQuality Scoring Heuristics
+
+        This file explains which scores are native from the underlying tools
+        and which scores are derived by PyQuality.
+
+        ## Native Scores
+
+        - `pylint`: native project score reported by pylint itself, on a `/10` scale and normalized by PyQuality to `/100`.
+
+        ## Derived Scores
+
+        The following tools do not provide a single native project score in the
+        way PyQuality displays today. PyQuality derives a `/100` value from the
+        findings produced by each tool.
+
+        - `flake8`: derived from reported findings.
+        - `bandit`: derived from reported findings.
+        - `vulture`: derived from reported findings.
+        - `mypy`: derived from reported findings.
+        - `radon`: derived from native metrics, using the average of:
+          - maintainability index
+          - a complexity score computed from average cyclomatic complexity
+
+        ## Penalty Model
+
+        For `flake8`, `bandit`, `vulture`, and `mypy`, PyQuality computes:
+
+        - `score = max(0, min(100, 100 - total_penalty))`
+        - `total_penalty = sum(penalty_for_each_finding)`
+
+        ### flake8 penalties
+
+        - `HIGH`: 12
+        - `MEDIUM`: 6
+        - `LOW`: 2
+        - `INFO`: 1
+
+        Severity mapping used by PyQuality:
+
+        - `F*` and `E9*` -> `HIGH`
+        - `C9*` -> `MEDIUM`
+        - `E*` and `W*` -> `LOW`
+
+        ### bandit penalties
+
+        - `CRITICAL`: 35
+        - `HIGH`: 20
+        - `MEDIUM`: 8
+        - `LOW`: 3
+
+        Severity mapping used by PyQuality:
+
+        - Bandit `HIGH` -> PyQuality `CRITICAL`
+        - Bandit `MEDIUM` -> PyQuality `HIGH`
+        - Bandit `LOW` -> PyQuality `MEDIUM`
+
+        ### vulture penalties
+
+        - `MEDIUM`: 8
+        - `LOW`: 4
+
+        Severity mapping used by PyQuality:
+
+        - confidence `>= 90` -> `MEDIUM`
+        - confidence `< 90` -> `LOW`
+
+        ### mypy penalties
+
+        - `HIGH`: 20
+        - `MEDIUM`: 8
+        - `LOW`: 2
+
+        Severity mapping used by PyQuality:
+
+        - `error` -> `HIGH`
+        - `warning` -> `MEDIUM`
+        - `note` -> `INFO`
+
+        ## Radon Formula
+
+        PyQuality does not use a native radon score. It derives one as:
+
+        - `mi_score = clamp(maintainability_index, 0..100)`
+        - `complexity_score` from average complexity bands
+        - `radon_score = (mi_score + complexity_score) / 2`
+
+        ## Overall Score
+
+        The overall PyQuality score is also derived. It is the arithmetic mean
+        of all per-tool scores that are available in the final report.
+    """)
+
+
+def write_reports(report: Report, reports_dir: str) -> Path:
+    report_root = Path(reports_dir)
+    tools_dir = report_root / "tools"
+    raw_dir = report_root / "raw"
+    report_root.mkdir(parents=True, exist_ok=True)
+    tools_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    payload = build_report_payload(report)
+    payload["generated_at"] = generated_at
+    (report_root / "summary.json").write_text(
+        json.dumps(payload, indent=2),
+        encoding="utf-8",
+    )
+
+    artifacts_by_tool: Dict[str, List[dict]] = defaultdict(list)
+    output_counts: Counter[str] = Counter()
+
+    for item in report.tool_outputs:
+        output_key = tool_output_key(item.get("cmd", []))
+        tool_name = output_group_name(output_key)
+        output_counts[output_key] += 1
+        suffix = "" if output_counts[output_key] == 1 else f"-{output_counts[output_key]}"
+        stem = f"{output_key}{suffix}"
+
+        artifact = {
+            "label": output_key,
+            "command": item.get("cmd", []),
+            "returncode": item.get("returncode"),
+            "stdout": item.get("stdout", ""),
+            "stderr": item.get("stderr", ""),
+        }
+
+        stdout_content = artifact["stdout"].strip()
+        if stdout_content:
+            parsed_stdout = parse_tool_json(artifact["stdout"])
+            stdout_ext = "json" if parsed_stdout is not None else "txt"
+            stdout_path = raw_dir / f"{stem}.stdout.{stdout_ext}"
+            stdout_value = artifact["stdout"]
+            if parsed_stdout is not None:
+                stdout_value = json.dumps(parsed_stdout, indent=2)
+            stdout_path.write_text(stdout_value, encoding="utf-8")
+            artifact["stdout_file"] = stdout_path.relative_to(report_root).as_posix()
+
+        stderr_content = artifact["stderr"].strip()
+        if stderr_content:
+            stderr_path = raw_dir / f"{stem}.stderr.txt"
+            stderr_path.write_text(artifact["stderr"], encoding="utf-8")
+            artifact["stderr_file"] = stderr_path.relative_to(report_root).as_posix()
+
+        meta_payload = {
+            "label": artifact["label"],
+            "command": artifact["command"],
+            "returncode": artifact["returncode"],
+            "stdout_file": artifact.get("stdout_file"),
+            "stderr_file": artifact.get("stderr_file"),
+        }
+        meta_path = raw_dir / f"{stem}.meta.json"
+        meta_path.write_text(json.dumps(meta_payload, indent=2), encoding="utf-8")
+        artifact["meta_file"] = meta_path.relative_to(report_root).as_posix()
+        artifacts_by_tool[tool_name].append(artifact)
+
+    for tool_name, _, _ in TOOL_DETAILS:
+        issues = tool_issues(report, tool_name)
+        errors = tool_errors(report, tool_name)
+        tool_artifacts = artifacts_by_tool.get(tool_name, [])
+        tool_payload = {
+            "tool": tool_name,
+            "generated_at": generated_at,
+            "score": report.tool_scores.get(tool_name),
+            "errors": errors,
+            "issues": [issue_to_dict(issue) for issue in issues],
+            "artifacts": [
+                {
+                    "label": artifact["label"],
+                    "command": artifact["command"],
+                    "returncode": artifact["returncode"],
+                    "meta_file": artifact.get("meta_file"),
+                    "stdout_file": artifact.get("stdout_file"),
+                    "stderr_file": artifact.get("stderr_file"),
+                }
+                for artifact in tool_artifacts
+            ],
+        }
+
+        (tools_dir / f"{tool_name}.json").write_text(
+            json.dumps(tool_payload, indent=2),
+            encoding="utf-8",
+        )
+        (tools_dir / f"{tool_name}.html").write_text(
+            render_tool_html(tool_name, report, generated_at, tool_artifacts),
+            encoding="utf-8",
+        )
+
+    (report_root / "index.md").write_text(
+        render_index_markdown(report, generated_at),
+        encoding="utf-8",
+    )
+    (report_root / "index.html").write_text(
+        render_index_html(report, generated_at),
+        encoding="utf-8",
+    )
+
+    scoring_notes_path = report_root / "scoring-heuristics.md"
+    if not scoring_notes_path.exists():
+        scoring_notes_path.write_text(
+            render_scoring_heuristics_markdown(),
+            encoding="utf-8",
+        )
+
+    return report_root
     print(json.dumps(result, indent=2))
 
 
@@ -1046,7 +1789,7 @@ def discover_menu_targets() -> List[str]:
         if entry.name in SKIP_DIRS:
             continue
 
-        if entry.is_file() and entry.suffix == ".py":
+        if entry.is_file() and entry.suffix == ".py" and entry.resolve() not in SKIP_PROJECT_FILES:
             targets.append(str(entry))
         elif entry.is_dir() and find_python_files(str(entry)):
             targets.append(str(entry))
@@ -1144,12 +1887,20 @@ def run_analysis_from_args(args) -> None:
         print(c(RED, f"Error: Path '{args.path}' not found"))
         sys.exit(1)
 
-    report = analyze(args.path, skip_mypy=args.skip_mypy)
+    report = analyze(
+        args.path,
+        skip_mypy=args.skip_mypy,
+        show_progress=not args.json,
+    )
+    if args.reports_dir:
+        write_reports(report, args.reports_dir)
 
     if args.json:
         output_json(report)
     else:
         print_report(report, verbose=args.verbose)
+        if args.reports_dir:
+            print(c(DIM, f"Detailed reports written to {args.reports_dir}"))
 
     if args.threshold:
         grade_order = {"A": 4, "B": 3, "C": 2, "D": 1, "F": 0}
@@ -1180,6 +1931,8 @@ def main():
               pyquality app.py --json       JSON output for CI pipelines
               pyquality src/ -t B           Fail if grade drops below B
               pyquality src/ --skip-mypy    Skip type checking (faster)
+              pyquality . --reports-dir docs/quality
+                                          Export markdown/html/json reports
         """)
     )
     parser.add_argument("path", nargs="?",
@@ -1193,6 +1946,8 @@ def main():
                         help="Fail (exit 1) if grade is below threshold")
     parser.add_argument("--skip-mypy", action="store_true",
                         help="Skip mypy type checking (faster)")
+    parser.add_argument("--reports-dir", default=None,
+                        help="Write detailed report artifacts to a directory")
 
     args = parser.parse_args()
 
