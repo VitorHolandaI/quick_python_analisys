@@ -1,6 +1,10 @@
 pylint
 flake8
+ruff
+prospector
 bandit
+semgrep
+pydeps
 radon
 vulture
 mypy

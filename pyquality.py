@@ -8,7 +8,11 @@ into a single quality report with an overall grade.
 Tools used:
   • pylint     — Linting, code smells, conventions, refactoring hints
   • flake8     — PEP 8 style + pyflakes logical errors
+  • ruff       — Fast aggregated lint rules across many Python ecosystems
+  • prospector — Aggregated Python static analysis across multiple checkers
   • bandit     — Security vulnerability scanning
+  • semgrep    — Pattern-based bug and security scanning
+  • pydeps     — Import graph and dependency structure analysis
   • radon      — Cyclomatic complexity & maintainability index
   • vulture    — Dead code detection
   • mypy       — Static type checking
@@ -20,7 +24,7 @@ Usage:
     python pyquality.py <path> -t B           # Fail if grade < B
 
 Requirements:
-    pip install pylint flake8 bandit radon vulture mypy
+    pip install pylint flake8 ruff prospector bandit semgrep pydeps radon vulture mypy
 """
 
 import argparse
@@ -30,13 +34,14 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import textwrap
 from datetime import datetime, timezone
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from html import escape as html_escape
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Sequence, Tuple
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -56,6 +61,101 @@ GRAY = "\033[90m"
 BG_RED = "\033[41m"
 
 NO_COLOR = os.environ.get("NO_COLOR") is not None
+
+BUNDLED_SEMGREP_RULES = textwrap.dedent("""\
+rules:
+  - id: pyquality.eval-use
+    message: Avoid eval(); it executes arbitrary code.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      category: security
+      confidence: HIGH
+      impact: HIGH
+    pattern: eval(...)
+
+  - id: pyquality.exec-use
+    message: Avoid exec(); it executes arbitrary code.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      category: security
+      confidence: HIGH
+      impact: HIGH
+    pattern: exec(...)
+
+  - id: pyquality.subprocess-shell-true
+    message: Avoid subprocess calls with shell=True.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      category: security
+      confidence: HIGH
+      impact: HIGH
+    patterns:
+      - pattern-either:
+          - pattern: subprocess.run(..., shell=True, ...)
+          - pattern: subprocess.call(..., shell=True, ...)
+          - pattern: subprocess.Popen(..., shell=True, ...)
+          - pattern: subprocess.check_call(..., shell=True, ...)
+          - pattern: subprocess.check_output(..., shell=True, ...)
+
+  - id: pyquality.unsafe-yaml-load
+    message: Prefer yaml.safe_load() over yaml.load().
+    severity: ERROR
+    languages: [python]
+    metadata:
+      category: security
+      confidence: MEDIUM
+      impact: HIGH
+    pattern: yaml.load(...)
+
+  - id: pyquality.pickle-load
+    message: Avoid loading untrusted pickle data.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      category: security
+      confidence: MEDIUM
+      impact: HIGH
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+
+  - id: pyquality.tempfile-mktemp
+    message: tempfile.mktemp() is insecure; use NamedTemporaryFile or mkstemp.
+    severity: ERROR
+    languages: [python]
+    metadata:
+      category: security
+      confidence: HIGH
+      impact: MEDIUM
+    pattern: tempfile.mktemp(...)
+
+  - id: pyquality.requests-without-timeout
+    message: Add an explicit timeout to requests calls.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      category: bug
+      confidence: MEDIUM
+      impact: MEDIUM
+    patterns:
+      - pattern: requests.$METHOD(...)
+      - pattern-not: requests.$METHOD(..., timeout=..., ...)
+
+  - id: pyquality.weak-hashlib
+    message: Avoid weak hashes like MD5 and SHA1 for security-sensitive code.
+    severity: WARNING
+    languages: [python]
+    metadata:
+      category: security
+      confidence: HIGH
+      impact: MEDIUM
+    pattern-either:
+      - pattern: hashlib.md5(...)
+      - pattern: hashlib.sha1(...)
+""")
 
 
 def c(code: str, text: str) -> str:
@@ -78,10 +178,6 @@ class Issue:
     code: str           # e.g. W0611, E302, B101
     message: str
     category: str       # Bug, Security, Style, Convention, Complexity, Dead Code, Type Error
-
-    @property
-    def severity_weight(self) -> int:
-        return {"CRITICAL": 10, "HIGH": 5, "MEDIUM": 3, "LOW": 1, "INFO": 0}.get(self.severity, 0)
 
 
 @dataclass
@@ -107,6 +203,7 @@ class Report:
     tool_errors: Dict[str, str] = field(default_factory=dict)
     tool_outputs: List[dict] = field(default_factory=list)
     radon_details: List[dict] = field(default_factory=list)
+    pydeps_metrics: Dict[str, object] = field(default_factory=dict)
     tool_scores: Dict[str, dict] = field(default_factory=dict)
 
 
@@ -138,9 +235,29 @@ TOOL_DETAILS = [
         "Checks formatting, unused imports, syntax-adjacent bugs, and pyflakes errors.",
     ),
     (
+        "ruff",
+        "Fast lint aggregation",
+        "Runs a broad, modern Python rule set quickly, covering flake8 families and many plugin-style checks.",
+    ),
+    (
+        "prospector",
+        "Aggregated static analysis",
+        "Runs a configured bundle of Python analyzers and profiles with one report.",
+    ),
+    (
         "bandit",
         "Security scanning",
         "Looks for risky Python patterns such as unsafe subprocess, debug servers, and weak crypto.",
+    ),
+    (
+        "semgrep",
+        "Pattern-based code scanning",
+        "Finds bug and security patterns using Semgrep rulesets, useful where Bandit's built-ins are narrower.",
+    ),
+    (
+        "pydeps",
+        "Import graph structure",
+        "Builds a Python import graph to surface cycles, fan-in, fan-out, and coupling hot spots.",
     ),
     (
         "radon",
@@ -201,10 +318,71 @@ def default_issue_file(files: Sequence[str]) -> str:
     return files[0] if files else ""
 
 
+def ensure_bundled_semgrep_config() -> str:
+    semgrep_dir = Path(tempfile.gettempdir()) / "pyquality-semgrep"
+    semgrep_dir.mkdir(parents=True, exist_ok=True)
+    config_path = semgrep_dir / "bundled-rules.yml"
+    if not config_path.exists() or config_path.read_text(encoding="utf-8") != BUNDLED_SEMGREP_RULES:
+        config_path.write_text(BUNDLED_SEMGREP_RULES, encoding="utf-8")
+    return str(config_path)
+
+
 def as_str(value: object, default: str = "") -> str:
     if value is None:
         return default
     return str(value)
+
+
+def merge_env(overrides: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    if not overrides:
+        return None
+
+    merged = os.environ.copy()
+    merged.update(overrides)
+    return merged
+
+
+def discover_package_roots(path: str) -> List[Path]:
+    target = Path(path).resolve()
+
+    def top_package_dir(start: Path) -> Optional[Path]:
+        current = start
+        package_root = None
+        while (current / "__init__.py").exists():
+            package_root = current
+            parent = current.parent
+            if parent == current:
+                break
+            current = parent
+        return package_root
+
+    if target.is_file():
+        root = top_package_dir(target.parent)
+        return [root] if root else []
+
+    if not target.is_dir():
+        return []
+
+    if (target / "__init__.py").exists():
+        return [target]
+
+    roots: List[Path] = []
+    seen: set[Path] = set()
+    for init_file in sorted(target.rglob("__init__.py")):
+        package_dir = init_file.parent
+        parent = package_dir.parent
+        nested = False
+        while parent != parent.parent and parent != target:
+            if (parent / "__init__.py").exists():
+                nested = True
+                break
+            parent = parent.parent
+        if nested or package_dir in seen:
+            continue
+        roots.append(package_dir)
+        seen.add(package_dir)
+
+    return roots
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -223,11 +401,33 @@ def max_parallel_jobs() -> int:
     return max(1, cpu_count // 3)
 
 
-def run_cmd(cmd: List[str], timeout: int = 120) -> Tuple[str, str, int]:
+def run_cmd(
+    cmd: List[str],
+    timeout: int = 120,
+    *,
+    cwd: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+    display_cmd: Optional[List[str]] = None,
+) -> Tuple[str, str, int]:
+    """Roda cmd e registra em COMMAND_LOG.
+
+    display_cmd: cmd "lógico" pra logar (ex: ["pydeps", path] mesmo quando o
+    subprocess real é `python -c <script>`). Permite que tool_output_key
+    identifique a ferramenta corretamente.
+    """
+    effective_env = merge_env(env)
+    logged_cmd = display_cmd if display_cmd is not None else cmd
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=cwd,
+            env=effective_env,
+        )
         COMMAND_LOG.append({
-            "cmd": cmd,
+            "cmd": logged_cmd,
             "stdout": result.stdout,
             "stderr": result.stderr,
             "returncode": result.returncode,
@@ -236,7 +436,7 @@ def run_cmd(cmd: List[str], timeout: int = 120) -> Tuple[str, str, int]:
     except FileNotFoundError:
         stderr = f"Tool not found: {cmd[0]}"
         COMMAND_LOG.append({
-            "cmd": cmd,
+            "cmd": logged_cmd,
             "stdout": "",
             "stderr": stderr,
             "returncode": -1,
@@ -245,12 +445,96 @@ def run_cmd(cmd: List[str], timeout: int = 120) -> Tuple[str, str, int]:
     except subprocess.TimeoutExpired:
         stderr = f"Timeout after {timeout}s"
         COMMAND_LOG.append({
-            "cmd": cmd,
+            "cmd": logged_cmd,
             "stdout": "",
             "stderr": stderr,
             "returncode": -1,
         })
         return "", stderr, -1
+
+
+def classify_ruff_issue(code: str) -> Tuple[str, str]:
+    if code.startswith("S"):
+        return "HIGH", "Security"
+    if code.startswith(("F", "B", "BLE", "PLE", "PLC")) or code.startswith("E9"):
+        return "HIGH", "Bug"
+    if code.startswith(("C90", "PLR09")):
+        return "MEDIUM", "Complexity"
+    if code.startswith(("E", "W", "I")):
+        return "LOW", "Style"
+    return "MEDIUM", "Code Smell"
+
+
+def classify_semgrep_issue(result: Dict[str, object]) -> Tuple[str, str]:
+    extra = result.get("extra", {})
+    if not isinstance(extra, dict):
+        extra = {}
+    metadata = extra.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+
+    category = as_str(metadata.get("category")).lower()
+    severity_name = as_str(extra.get("severity"), "WARNING").upper()
+    severity_map = {"ERROR": "HIGH", "WARNING": "MEDIUM", "INFO": "LOW"}
+    severity = severity_map.get(severity_name, "MEDIUM")
+    issue_category = "Security" if category == "security" else "Bug"
+
+    if issue_category == "Security" and severity == "HIGH":
+        impact = as_str(metadata.get("impact")).upper()
+        confidence = as_str(metadata.get("confidence")).upper()
+        if impact == "HIGH" and confidence == "HIGH":
+            severity = "CRITICAL"
+
+    return severity, issue_category
+
+
+def classify_prospector_issue(source: str, code: str, message: str) -> Tuple[str, str]:
+    normalized_source = source.lower()
+    normalized_code = code.upper()
+    normalized_message = message.lower()
+
+    if normalized_source == "bandit":
+        if normalized_code.startswith("B"):
+            return "HIGH", "Security"
+        return "MEDIUM", "Security"
+    if normalized_source == "dodgy":
+        return "HIGH", "Security"
+    if normalized_source == "mccabe":
+        return "MEDIUM", "Complexity"
+    if normalized_source == "vulture":
+        return "LOW", "Dead Code"
+    if normalized_source in {"mypy", "pyright"}:
+        return "HIGH", "Type Error"
+    if normalized_source == "pydocstyle":
+        return "LOW", "Convention"
+    if normalized_source == "pycodestyle":
+        if normalized_code.startswith("E9"):
+            return "HIGH", "Bug"
+        if normalized_code.startswith(("E", "W")):
+            return "LOW", "Style"
+        return "MEDIUM", "Style"
+    if normalized_source == "pyflakes":
+        return "HIGH", "Bug"
+    if normalized_source == "pylint":
+        if normalized_code.startswith(("E", "F")):
+            return "HIGH", "Bug"
+        if normalized_code.startswith("W"):
+            return "MEDIUM", "Bug"
+        if normalized_code.startswith("R"):
+            return "LOW", "Code Smell"
+        if normalized_code.startswith("C"):
+            return "LOW", "Convention"
+        if any(token in normalized_message for token in ("undefined", "unreachable", "not available", "import error")):
+            return "HIGH", "Bug"
+        if any(token in normalized_message for token in ("unused", "cell variable", "subprocess.run")):
+            return "MEDIUM", "Bug"
+        if normalized_code.startswith("TOO-MANY-") or normalized_code == "DISALLOWED-NAME":
+            return "LOW", "Code Smell"
+        return "MEDIUM", "Code Smell"
+
+    if "security" in normalized_message or "password" in normalized_message or "secret" in normalized_message:
+        return "HIGH", "Security"
+    return "MEDIUM", "Code Smell"
 
 
 # ── PYLINT ──────────────────────────────────────────────────────────────────
@@ -321,6 +605,21 @@ def run_pylint(files: List[str]) -> Tuple[List[Issue], Optional[float], Optional
 
 # ── FLAKE8 ──────────────────────────────────────────────────────────────────
 
+# Ordem importa: prefixos mais específicos antes dos genéricos (E9 antes de E).
+FLAKE8_RULES: List[Tuple[Tuple[str, ...], Tuple[str, str]]] = [
+    (("E9", "F"),  ("HIGH",   "Bug")),
+    (("C9",),      ("MEDIUM", "Complexity")),
+    (("E", "W"),   ("LOW",    "Style")),
+]
+
+
+def classify_flake8(code: str) -> Tuple[str, str]:
+    for prefixes, result in FLAKE8_RULES:
+        if code.startswith(prefixes):
+            return result
+    return ("LOW", "Style")
+
+
 def run_flake8(files: List[str]) -> Tuple[List[Issue], Optional[str]]:
     cmd = [
         resolve_tool_path("flake8"),
@@ -338,14 +637,7 @@ def run_flake8(files: List[str]) -> Tuple[List[Issue], Optional[str]]:
         m = re.match(r"^(.+?):(\d+):(\d+):([A-Z]\d+):(.+)$", line)
         if m:
             fpath, lineno, col, code, message = m.groups()
-            if code.startswith("E9") or code.startswith("F"):
-                severity, category = "HIGH", "Bug"
-            elif code.startswith(("E", "W")):
-                severity, category = "LOW", "Style"
-            elif code.startswith("C9"):
-                severity, category = "MEDIUM", "Complexity"
-            else:
-                severity, category = "LOW", "Style"
+            severity, category = classify_flake8(code)
 
             issues.append(Issue(
                 tool="flake8", file=fpath, line=int(lineno),
@@ -354,6 +646,146 @@ def run_flake8(files: List[str]) -> Tuple[List[Issue], Optional[str]]:
             ))
 
     return issues, None
+
+
+# ── RUFF ────────────────────────────────────────────────────────────────────
+
+def run_ruff(files: List[str]) -> Tuple[List[Issue], Optional[str]]:
+    cmd = [
+        resolve_tool_path("ruff"),
+        "check",
+        "--output-format=json",
+        "--exit-zero",
+        *files,
+    ]
+    stdout, stderr, rc = run_cmd(cmd)
+    issues: List[Issue] = []
+
+    if rc == -1:
+        return issues, stderr or "Failed to run ruff"
+
+    if rc not in (0,) and not stdout.strip():
+        return issues, stderr or "Ruff failed"
+
+    if not stdout.strip():
+        return issues, None
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return issues, "Failed to parse ruff output"
+
+    if not isinstance(data, list):
+        return issues, "Unexpected ruff output format"
+
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        code = as_str(item.get("code"), "?")
+        location = item.get("location", {})
+        if not isinstance(location, dict):
+            location = {}
+        severity, category = classify_ruff_issue(code)
+        issues.append(Issue(
+            tool="ruff",
+            file=as_str(item.get("filename"), default_issue_file(files)),
+            line=int(location.get("row", 0) or 0),
+            col=int(location.get("column", 0) or 0),
+            severity=severity,
+            code=code,
+            message=as_str(item.get("message")),
+            category=category,
+        ))
+
+    return issues, None
+
+
+# ── PROSPECTOR ──────────────────────────────────────────────────────────────
+
+def run_prospector(files: List[str], strictness: str = "medium") -> Tuple[List[Issue], Optional[str]]:
+    cmd = [
+        resolve_tool_path("prospector"),
+        "--output-format", "json",
+        "--strictness", strictness,
+        *files,
+    ]
+    stdout, stderr, rc = run_cmd(cmd, timeout=240)
+    issues: List[Issue] = []
+
+    if rc == -1:
+        return issues, stderr or "Failed to run prospector"
+
+    if rc not in (0, 1) and not stdout.strip():
+        return issues, stderr or "Prospector failed"
+
+    if not stdout.strip():
+        return issues, None
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return issues, "Failed to parse prospector output"
+
+    if isinstance(data, dict):
+        messages = data.get("messages", [])
+    elif isinstance(data, list):
+        messages = data
+    else:
+        return issues, "Unexpected prospector output format"
+
+    if not isinstance(messages, list):
+        return issues, "Unexpected prospector messages format"
+
+    for item in messages:
+        if not isinstance(item, dict):
+            continue
+
+        location = item.get("location", {})
+        if not isinstance(location, dict):
+            location = {}
+
+        path_value = (
+            location.get("path")
+            or item.get("path")
+            or item.get("file")
+            or default_issue_file(files)
+        )
+        line_value = location.get("line") or item.get("line") or 0
+        col_value = (
+            location.get("character")
+            or location.get("column")
+            or item.get("character")
+            or item.get("column")
+            or 0
+        )
+        source = as_str(item.get("source"), "prospector")
+        code = as_str(item.get("code"), "prospector")
+        if code.lower() in PROSPECTOR_NOISE_CODES:
+            continue
+        message = as_str(item.get("message"))
+        severity, category = classify_prospector_issue(source, code, message)
+
+        issues.append(Issue(
+            tool="prospector",
+            file=as_str(path_value, default_issue_file(files)),
+            line=int(line_value or 0),
+            col=int(col_value or 0),
+            severity=severity,
+            code=f"{source}:{code}" if source and code else code or source or "prospector",
+            message=message,
+            category=category,
+        ))
+
+    return issues, None
+
+
+# Codes que prospector emite por causa de plugins ausentes (ex: pylint-django
+# não instalado) — ruído, não problema do código analisado.
+PROSPECTOR_NOISE_CODES = {
+    "django-not-available",
+    "flask-not-available",
+    "celery-not-available",
+}
 
 
 # ── BANDIT ──────────────────────────────────────────────────────────────────
@@ -391,7 +823,247 @@ def run_bandit(files: List[str]) -> Tuple[List[Issue], Optional[str]]:
     return issues, None
 
 
+# ── SEMGREP ─────────────────────────────────────────────────────────────────
+
+def run_semgrep(files: List[str], config: Optional[str] = None) -> Tuple[List[Issue], Optional[str]]:
+    effective_config = config or ensure_bundled_semgrep_config()
+    cmd = [
+        resolve_tool_path("semgrep"),
+        "scan",
+        "--config", effective_config,
+        "--metrics=off",
+        "--disable-version-check",
+        "--quiet",
+        "--json",
+        *files,
+    ]
+    semgrep_dir = Path(tempfile.gettempdir()) / "pyquality-semgrep"
+    semgrep_settings = semgrep_dir / "settings.yaml"
+    semgrep_log = semgrep_dir / "semgrep.log"
+    stdout, stderr, rc = run_cmd(
+        cmd,
+        timeout=240,
+        env={
+            "XDG_CONFIG_HOME": str(semgrep_dir),
+            "SEMGREP_SETTINGS_FILE": str(semgrep_settings),
+            "SEMGREP_LOG_FILE": str(semgrep_log),
+        },
+    )
+    issues: List[Issue] = []
+
+    if rc == -1:
+        return issues, stderr or "Failed to run semgrep"
+
+    if rc not in (0,) and not stdout.strip():
+        return issues, stderr or "Semgrep failed"
+
+    if not stdout.strip():
+        return issues, None
+
+    try:
+        data = json.loads(stdout)
+    except json.JSONDecodeError:
+        return issues, "Failed to parse semgrep output"
+
+    if not isinstance(data, dict):
+        return issues, "Unexpected semgrep output format"
+
+    results = data.get("results", [])
+    if not isinstance(results, list):
+        return issues, "Unexpected semgrep results format"
+
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        start = result.get("start", {})
+        if not isinstance(start, dict):
+            start = {}
+        extra = result.get("extra", {})
+        if not isinstance(extra, dict):
+            extra = {}
+        severity, category = classify_semgrep_issue(result)
+        issues.append(Issue(
+            tool="semgrep",
+            file=as_str(result.get("path"), default_issue_file(files)),
+            line=int(start.get("line", 0) or 0),
+            col=int(start.get("col", 0) or 0),
+            severity=severity,
+            code=as_str(result.get("check_id"), "semgrep"),
+            message=as_str(extra.get("message")),
+            category=category,
+        ))
+
+    errors = data.get("errors", [])
+    if errors:
+        messages = []
+        for error in errors:
+            if isinstance(error, dict):
+                messages.append(as_str(error.get("message")))
+            else:
+                messages.append(as_str(error))
+        message = "; ".join(item for item in messages if item)
+        if message:
+            return issues, message
+
+    return issues, None
+
+
+# ── PYDEPS ──────────────────────────────────────────────────────────────────
+
+PYDEPS_HELPER_SCRIPT = r"""
+import json, sys
+from pydeps import cli
+from pydeps.target import Target
+from pydeps.py2depgraph import py2dep
+
+argv = ['pydeps', sys.argv[1], '--no-output', '--nodot', '--max-bacon', '0']
+args = cli.parse_args(argv[1:])
+fname = args.pop('fname')
+target = Target(fname)
+target.chdir_work()
+graph = py2dep(target, **args)
+graph.find_import_cycles()
+
+modules = {}
+for name, src in graph.sources.items():
+    path = getattr(src, 'path', None)
+    if not path:
+        continue
+    modules[name] = {
+        'path': path,
+        'imports': list(getattr(src, 'imports', []) or []),
+        'imported_by': list(getattr(src, 'imported_by', []) or []),
+    }
+
+cycles = [[n.name for n in c] for c in getattr(graph, 'cycles', []) or []]
+json.dump({'modules': modules, 'cycles': cycles}, sys.stdout)
+"""
+
+
+def run_pydeps(path: str) -> Tuple[List[Issue], Dict[str, object], Optional[str]]:
+    package_roots = discover_package_roots(path)
+    if not package_roots:
+        return [], {}, "Pydeps requires at least one package directory with __init__.py."
+
+    internal_modules: Dict[str, dict] = {}
+    cycles: List[List[str]] = []
+
+    for package_root in package_roots:
+        cmd = [sys.executable, "-c", PYDEPS_HELPER_SCRIPT, str(package_root)]
+        stdout, stderr, rc = run_cmd(
+            cmd,
+            timeout=240,
+            display_cmd=["pydeps", str(package_root)],
+        )
+        if rc == -1:
+            return [], {}, stderr or "Failed to run pydeps"
+        if not stdout.strip():
+            if stderr.strip():
+                return [], {}, stderr or "Pydeps failed"
+            continue
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            return [], {}, "Failed to parse pydeps output"
+
+        for name, info in (data.get("modules") or {}).items():
+            if isinstance(info, dict) and info.get("path"):
+                internal_modules[name] = info
+        for cycle in data.get("cycles") or []:
+            if isinstance(cycle, list) and len(cycle) > 1:
+                cycles.append(sorted(str(n) for n in cycle))
+
+    if not internal_modules:
+        return [], {}, "Pydeps found no internal package graph for the selected target."
+
+    edge_set: set[Tuple[str, str]] = set()
+    fan_in: Counter[str] = Counter()
+    fan_out: Counter[str] = Counter()
+
+    for module_name, info in internal_modules.items():
+        imports = info.get("imports", []) or []
+        for imported in imports:
+            imported_name = as_str(imported)
+            if imported_name not in internal_modules or imported_name == module_name:
+                continue
+            edge = (module_name, imported_name)
+            if edge in edge_set:
+                continue
+            edge_set.add(edge)
+            fan_out[module_name] += 1
+            fan_in[imported_name] += 1
+
+    max_fan_out_module = max(fan_out, key=fan_out.get, default="")
+    max_fan_in_module = max(fan_in, key=fan_in.get, default="")
+    metrics = {
+        "package_roots": [str(root) for root in package_roots],
+        "modules": len(internal_modules),
+        "edges": len(edge_set),
+        "cycle_groups": len(cycles),
+        "cycle_modules": sum(len(component) for component in cycles),
+        "avg_out_degree": round(len(edge_set) / max(len(internal_modules), 1), 2),
+        "max_fan_out": fan_out.get(max_fan_out_module, 0),
+        "max_fan_out_module": max_fan_out_module,
+        "max_fan_in": fan_in.get(max_fan_in_module, 0),
+        "max_fan_in_module": max_fan_in_module,
+        "cycles": cycles,
+    }
+
+    issues: List[Issue] = []
+    for component in cycles:
+        module_name = component[0]
+        info = internal_modules.get(module_name, {})
+        issues.append(Issue(
+            tool="pydeps",
+            file=as_str(info.get("path"), default_issue_file([path])),
+            line=0,
+            col=0,
+            severity="HIGH" if len(component) >= 4 else "MEDIUM",
+            code="PYDEPS-CYCLE",
+            message=f"Import cycle across {len(component)} modules: {', '.join(component)}",
+            category="Complexity",
+        ))
+
+    if metrics["max_fan_out"] >= 10:
+        module_name = metrics["max_fan_out_module"]
+        info = internal_modules.get(module_name, {})
+        issues.append(Issue(
+            tool="pydeps",
+            file=as_str(info.get("path"), default_issue_file([path])),
+            line=0,
+            col=0,
+            severity="MEDIUM" if metrics["max_fan_out"] >= 14 else "LOW",
+            code="PYDEPS-FANOUT",
+            message=f"Module '{module_name}' imports {metrics['max_fan_out']} internal modules.",
+            category="Code Smell",
+        ))
+
+    if metrics["max_fan_in"] >= 12:
+        module_name = metrics["max_fan_in_module"]
+        info = internal_modules.get(module_name, {})
+        issues.append(Issue(
+            tool="pydeps",
+            file=as_str(info.get("path"), default_issue_file([path])),
+            line=0,
+            col=0,
+            severity="LOW",
+            code="PYDEPS-FANIN",
+            message=f"Module '{module_name}' is imported by {metrics['max_fan_in']} internal modules.",
+            category="Code Smell",
+        ))
+
+    return issues, metrics, None
+
+
 # ── RADON ───────────────────────────────────────────────────────────────────
+
+def severity_for_cc(cc: int) -> Optional[str]:
+    if cc > 15:
+        return "HIGH"
+    if cc > 10:
+        return "MEDIUM"
+    return None
+
 
 def run_radon_cc(files: List[str]) -> Tuple[List[Issue], List[dict], Optional[str]]:
     cmd = [resolve_tool_path("radon"), "cc", "-s", "-j", *files]
@@ -420,17 +1092,11 @@ def run_radon_cc(files: List[str]) -> Tuple[List[Issue], List[dict], Optional[st
                 "file": fpath, "name": name, "type": block.get("type", "?"),
                 "complexity": cc, "rank": rank, "line": lineno,
             })
-            if cc > 15:
+            sev = severity_for_cc(cc)
+            if sev:
                 issues.append(Issue(
                     tool="radon", file=fpath, line=lineno, col=0,
-                    severity="HIGH", code=f"CC-{rank}",
-                    message=f"'{name}' has cyclomatic complexity of {cc} (rank {rank})",
-                    category="Complexity",
-                ))
-            elif cc > 10:
-                issues.append(Issue(
-                    tool="radon", file=fpath, line=lineno, col=0,
-                    severity="MEDIUM", code=f"CC-{rank}",
+                    severity=sev, code=f"CC-{rank}",
                     message=f"'{name}' has cyclomatic complexity of {cc} (rank {rank})",
                     category="Complexity",
                 ))
@@ -656,7 +1322,9 @@ def build_radon_tool_score(
     max_complexity: Optional[float],
     block_count: Optional[int],
 ) -> Dict[str, object]:
-    mi_score = clamp_score(maintainability_index if maintainability_index is not None else 100.0)
+    mi_score = clamp_score(score_maintainability_index(
+        maintainability_index if maintainability_index is not None else 100.0
+    ))
     cc_score = clamp_score(score_complexity_metric(avg_complexity or 0.0))
     return make_tool_score(
         (mi_score + cc_score) / 2,
@@ -677,9 +1345,21 @@ PENALTY_TOOL_CONFIGS = {
         {"HIGH": 12, "MEDIUM": 6, "LOW": 2, "INFO": 1},
         "Score derivado apenas das ocorrencias reportadas pelo flake8.",
     ),
+    "ruff": (
+        {"CRITICAL": 25, "HIGH": 12, "MEDIUM": 5, "LOW": 2, "INFO": 1},
+        "Score derivado apenas das ocorrencias reportadas pelo ruff.",
+    ),
+    "prospector": (
+        {"CRITICAL": 25, "HIGH": 12, "MEDIUM": 5, "LOW": 2, "INFO": 1},
+        "Score derivado apenas das ocorrencias reportadas pelo prospector.",
+    ),
     "bandit": (
         {"CRITICAL": 35, "HIGH": 20, "MEDIUM": 8, "LOW": 3},
         "Score derivado apenas das vulnerabilidades reportadas pelo bandit.",
+    ),
+    "semgrep": (
+        {"CRITICAL": 35, "HIGH": 18, "MEDIUM": 8, "LOW": 3},
+        "Score derivado apenas das ocorrencias reportadas pelo semgrep.",
     ),
     "vulture": (
         {"MEDIUM": 8, "LOW": 4},
@@ -688,6 +1368,10 @@ PENALTY_TOOL_CONFIGS = {
     "mypy": (
         {"HIGH": 20, "MEDIUM": 8, "LOW": 2},
         "Score derivado apenas dos erros e avisos reportados pelo mypy.",
+    ),
+    "pydeps": (
+        {"HIGH": 15, "MEDIUM": 6, "LOW": 2},
+        "Score derivado dos ciclos de import e hot spots de acoplamento reportados pelo pydeps.",
     ),
 }
 
@@ -754,11 +1438,117 @@ def grade_from_score(score: float) -> str:
 # ANALYSIS ORCHESTRATOR
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def analyze(path: str, skip_mypy: bool = False, show_progress: bool = True) -> Report:
+class ToolAdapter(Protocol):
+    """Contrato pra adapter: roda ferramenta, devolve dados normalizados.
+
+    Returns:
+        (issues, attrs, score_kwargs, err)
+        - issues: lista de Issue pra report.issues.extend(...)
+        - attrs:  campos do Report pra setattr (ex: {"pylint_score": 8.5})
+        - score_kwargs: kwargs extras pra compute_tool_score_map
+        - err: msg de erro ou None
+    """
+    def __call__(
+        self,
+        files: List[str],
+        **opts: Any,
+    ) -> Tuple[List[Issue], Dict[str, Any], Dict[str, Any], Optional[str]]:
+        ...
+
+
+def _wrap_simple(fn: Callable[[List[str]], Tuple[List[Issue], Optional[str]]]) -> ToolAdapter:
+    def adapter(files: List[str], **_: Any):
+        issues, err = fn(files)
+        return issues, {}, {}, err
+    return adapter
+
+
+def _adapt_pylint(files: List[str], **_: Any):
+    issues, score, err = run_pylint(files)
+    return issues, {"pylint_score": score}, {"pylint_score": score}, err
+
+
+def _adapt_prospector(files: List[str], **opts: Any):
+    issues, err = run_prospector(files, opts["prospector_strictness"])
+    return issues, {}, {}, err
+
+
+def _adapt_semgrep(files: List[str], **opts: Any):
+    issues, err = run_semgrep(files, opts["semgrep_config"])
+    return issues, {}, {}, err
+
+
+def _adapt_pydeps(files: List[str], **opts: Any):
+    # Pydeps opera sobre o diretório-raiz, não na lista de arquivos.
+    issues, metrics, err = run_pydeps(opts["path"])
+    return issues, {"pydeps_metrics": metrics}, {}, err
+
+
+SIMPLE_RUNNERS: Dict[str, ToolAdapter] = {
+    "pylint":     _adapt_pylint,
+    "flake8":     _wrap_simple(run_flake8),
+    "ruff":       _wrap_simple(run_ruff),
+    "prospector": _adapt_prospector,
+    "bandit":     _wrap_simple(run_bandit),
+    "semgrep":    _adapt_semgrep,
+    "pydeps":     _adapt_pydeps,
+    "vulture":    _wrap_simple(run_vulture),
+    "mypy":       _wrap_simple(run_mypy),
+}
+
+
+def _run_radon_bundle(py_files: List[str], report: Report) -> None:
+    """Radon roda 3 subcommandos e agrega métricas. Mutates report direto."""
+    cc_issues, cc_details, err_cc = run_radon_cc(py_files)
+    report.issues.extend(cc_issues)
+    report.radon_details = cc_details
+    if err_cc:
+        report.tool_errors["radon-cc"] = err_cc
+
+    mi, err_mi = run_radon_mi(py_files)
+    report.maintainability_index = mi
+    if err_mi:
+        report.tool_errors["radon-mi"] = err_mi
+
+    raw, err_raw = run_radon_raw(py_files)
+    report.total_lines = raw["loc"]
+    report.code_lines = raw["sloc"]
+    report.comment_lines = raw["comments"] + raw["multi"]
+    report.blank_lines = raw["blank"]
+    if err_raw:
+        report.tool_errors["radon-raw"] = err_raw
+
+    if cc_details:
+        ccs = [d["complexity"] for d in cc_details]
+        report.avg_complexity = round(sum(ccs) / len(ccs), 1)
+        mx = max(range(len(ccs)), key=lambda i: ccs[i])
+        report.max_complexity = ccs[mx]
+        report.max_complexity_func = f"{cc_details[mx]['file']}::{cc_details[mx]['name']}"
+
+    first_err = err_cc or err_mi or err_raw
+    if first_err:
+        report.tool_scores["radon"] = unavailable_tool_score(first_err)
+    else:
+        report.tool_scores["radon"] = compute_tool_score_map(
+            "radon",
+            maintainability_index=report.maintainability_index,
+            avg_complexity=report.avg_complexity,
+            max_complexity=report.max_complexity,
+            block_count=len(cc_details),
+        )
+
+
+def analyze(
+    path: str,
+    skip_mypy: bool = False,
+    show_progress: bool = True,
+    semgrep_config: Optional[str] = None,
+    prospector_strictness: str = "medium",
+) -> Report:
     COMMAND_LOG.clear()
     report = Report(path=path)
     py_files = find_python_files(path)
-    report.analyzed_files = list(py_files)
+    report.analyzed_files = py_files
     report.files_analyzed = len(py_files)
 
     if not py_files:
@@ -784,96 +1574,31 @@ def analyze(path: str, skip_mypy: bool = False, show_progress: bool = True) -> R
         if show_progress:
             print(c(DIM, f"  [{i}/{len(steps)}] {name:<8} — {desc}..."))
 
-        if name == "pylint":
-            issues, score, err = run_pylint(py_files)
-            report.issues.extend(issues)
-            report.pylint_score = score
-            if err:
-                report.tool_scores[name] = unavailable_tool_score(err)
-            else:
-                report.tool_scores[name] = compute_tool_score_map(
-                    name,
-                    issues=issues,
-                    pylint_score=score,
-                )
-            if err: report.tool_errors[name] = err
+        if name == "radon":
+            _run_radon_bundle(py_files, report)
+            continue
 
-        elif name == "flake8":
-            issues, err = run_flake8(py_files)
-            report.issues.extend(issues)
-            if err:
-                report.tool_scores[name] = unavailable_tool_score(err)
-            else:
-                report.tool_scores[name] = compute_tool_score_map(name, issues=issues)
-            if err: report.tool_errors[name] = err
+        adapter = SIMPLE_RUNNERS.get(name)
+        if adapter is None:
+            continue  # tool sem runner registrado
 
-        elif name == "bandit":
-            issues, err = run_bandit(py_files)
-            report.issues.extend(issues)
-            report.security_issues = len(issues)
-            if err:
-                report.tool_scores[name] = unavailable_tool_score(err)
-            else:
-                report.tool_scores[name] = compute_tool_score_map(name, issues=issues)
-            if err: report.tool_errors[name] = err
+        issues, attrs, score_kwargs, err = adapter(
+            py_files,
+            path=path,
+            prospector_strictness=prospector_strictness,
+            semgrep_config=semgrep_config,
+        )
+        report.issues.extend(issues)
+        for k, v in attrs.items():
+            setattr(report, k, v)
 
-        elif name == "radon":
-            cc_issues, cc_details, err = run_radon_cc(py_files)
-            report.issues.extend(cc_issues)
-            report.radon_details = cc_details
-            if err: report.tool_errors["radon-cc"] = err
-
-            mi, err = run_radon_mi(py_files)
-            report.maintainability_index = mi
-            if err: report.tool_errors["radon-mi"] = err
-
-            raw, err = run_radon_raw(py_files)
-            report.total_lines = raw["loc"]
-            report.code_lines = raw["sloc"]
-            report.comment_lines = raw["comments"] + raw["multi"]
-            report.blank_lines = raw["blank"]
-            if err: report.tool_errors["radon-raw"] = err
-
-            if cc_details:
-                ccs = [d["complexity"] for d in cc_details]
-                report.avg_complexity = round(sum(ccs) / len(ccs), 1)
-                mx = max(range(len(ccs)), key=lambda i: ccs[i])
-                report.max_complexity = ccs[mx]
-                report.max_complexity_func = (
-                    f"{cc_details[mx]['file']}::{cc_details[mx]['name']}"
-                )
-
-            if err or report.tool_errors.get("radon-mi") or report.tool_errors.get("radon-raw"):
-                first_error = err or report.tool_errors.get("radon-mi") or report.tool_errors.get("radon-raw")
-                report.tool_scores[name] = unavailable_tool_score(first_error)
-            else:
-                report.tool_scores[name] = compute_tool_score_map(
-                    name,
-                    maintainability_index=report.maintainability_index,
-                    avg_complexity=report.avg_complexity,
-                    max_complexity=report.max_complexity,
-                    block_count=len(cc_details),
-                )
-
-        elif name == "vulture":
-            issues, err = run_vulture(py_files)
-            report.issues.extend(issues)
-            report.dead_code_count = len(issues)
-            if err:
-                report.tool_scores[name] = unavailable_tool_score(err)
-            else:
-                report.tool_scores[name] = compute_tool_score_map(name, issues=issues)
-            if err: report.tool_errors[name] = err
-
-        elif name == "mypy":
-            issues, err = run_mypy(py_files)
-            report.issues.extend(issues)
-            report.type_errors = len([i for i in issues if i.severity != "INFO"])
-            if err:
-                report.tool_scores[name] = unavailable_tool_score(err)
-            else:
-                report.tool_scores[name] = compute_tool_score_map(name, issues=issues)
-            if err: report.tool_errors[name] = err
+        if err:
+            report.tool_scores[name] = unavailable_tool_score(err)
+            report.tool_errors[name] = err
+        else:
+            report.tool_scores[name] = compute_tool_score_map(
+                name, issues=issues, **score_kwargs,
+            )
 
     # Deduplicate (same file + line + message from different tools)
     seen = set()
@@ -884,6 +1609,11 @@ def analyze(path: str, skip_mypy: bool = False, show_progress: bool = True) -> R
             seen.add(key)
             deduped.append(issue)
     report.issues = deduped
+
+    # Category tallies derivam de report.issues (fonte única de verdade).
+    report.security_issues = sum(1 for i in report.issues if i.category == "Security")
+    report.type_errors     = sum(1 for i in report.issues if i.category == "Type Error")
+    report.dead_code_count = sum(1 for i in report.issues if i.category == "Dead Code")
 
     report.quality_score = compute_quality_score(report)
     report.grade = grade_from_score(report.quality_score)
@@ -974,6 +1704,60 @@ def print_flake8_details(item: dict):
         print(f"      {line}")
 
 
+def print_ruff_details(item: dict):
+    data = parse_tool_json(item["stdout"])
+    if not isinstance(data, list):
+        print("    No structured ruff output.")
+        return
+
+    if not data:
+        print("    Findings: none")
+        return
+
+    print(f"    Findings: {len(data)}")
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        location = entry.get("location", {})
+        if not isinstance(location, dict):
+            location = {}
+        print(
+            f"      L{location.get('row', 0):<4} "
+            f"{as_str(entry.get('code'), '?'):<8} "
+            f"{as_str(entry.get('message'))}"
+        )
+
+
+def print_prospector_details(item: dict):
+    data = parse_tool_json(item["stdout"])
+    if isinstance(data, dict):
+        messages = data.get("messages", [])
+    elif isinstance(data, list):
+        messages = data
+    else:
+        print("    No structured prospector output.")
+        return
+
+    if not isinstance(messages, list) or not messages:
+        print("    Findings: none")
+        return
+
+    print(f"    Findings: {len(messages)}")
+    for entry in messages:
+        if not isinstance(entry, dict):
+            continue
+        location = entry.get("location", {})
+        if not isinstance(location, dict):
+            location = {}
+        source = as_str(entry.get("source"), "prospector")
+        code = as_str(entry.get("code"), "?")
+        print(
+            f"      L{location.get('line', entry.get('line', 0)):<4} "
+            f"{source}:{code:<18} "
+            f"{as_str(entry.get('message'))}"
+        )
+
+
 def print_bandit_details(item: dict):
     data = parse_tool_json(item["stdout"])
     if not data:
@@ -1002,6 +1786,34 @@ def print_bandit_details(item: dict):
             f"{result.get('test_id', '?'):<6} "
             f"{result.get('issue_severity', '?'):<6} "
             f"{result.get('issue_text', '')}"
+        )
+
+
+def print_semgrep_details(item: dict):
+    data = parse_tool_json(item["stdout"])
+    if not isinstance(data, dict):
+        print("    No structured semgrep output.")
+        return
+
+    results = data.get("results", [])
+    if not isinstance(results, list) or not results:
+        print("    Findings: none")
+        return
+
+    print(f"    Findings: {len(results)}")
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        start = result.get("start", {})
+        if not isinstance(start, dict):
+            start = {}
+        extra = result.get("extra", {})
+        if not isinstance(extra, dict):
+            extra = {}
+        print(
+            f"      L{start.get('line', 0):<4} "
+            f"{as_str(result.get('check_id'), 'semgrep'):<32} "
+            f"{as_str(extra.get('message'))}"
         )
 
 
@@ -1072,38 +1884,76 @@ def print_line_tool_details(item: dict, label: str):
         print(f"      {line}")
 
 
+def print_pydeps_details(item: dict):
+    data = parse_tool_json(item["stdout"])
+    if not isinstance(data, dict):
+        print("    No structured pydeps output.")
+        return
+
+    modules = data.get("modules") or {}
+    cycles = data.get("cycles") or []
+    print(f"    Modules analyzed: {len(modules)}")
+    if not modules:
+        return
+
+    fan_in = Counter()
+    fan_out = Counter()
+    edges = 0
+    for name, info in modules.items():
+        if not isinstance(info, dict):
+            continue
+        for dep in info.get("imports") or []:
+            if dep in modules and dep != name:
+                fan_out[name] += 1
+                fan_in[dep] += 1
+                edges += 1
+
+    print(f"    Edges: {edges}")
+    print(f"    Avg out-degree: {round(edges / max(len(modules), 1), 2)}")
+
+    print(f"    Import cycles: {len(cycles)}")
+    for cycle in cycles[:10]:
+        print(f"      cycle ({len(cycle)}): {', '.join(cycle)}")
+
+    if fan_out:
+        top_out = fan_out.most_common(5)
+        print("    Top fan-out:")
+        for name, count in top_out:
+            print(f"      {count:>3}  {name}")
+    if fan_in:
+        top_in = fan_in.most_common(5)
+        print("    Top fan-in:")
+        for name, count in top_in:
+            print(f"      {count:>3}  {name}")
+
+
+TOOL_PRINTERS: Dict[str, Tuple[str, Callable[[dict], None]]] = {
+    "pylint":     ("pylint",                print_pylint_details),
+    "flake8":     ("flake8",                print_flake8_details),
+    "ruff":       ("ruff",                  print_ruff_details),
+    "prospector": ("prospector",            print_prospector_details),
+    "bandit":     ("bandit",                print_bandit_details),
+    "semgrep":    ("semgrep",               print_semgrep_details),
+    "pydeps":     ("pydeps",                print_pydeps_details),
+    "radon-cc":   ("radon complexity",      print_radon_cc_details),
+    "radon-mi":   ("radon maintainability", print_radon_mi_details),
+    "radon-raw":  ("radon raw metrics",     print_radon_raw_details),
+    "vulture":    ("vulture", lambda item: print_line_tool_details(item, "Dead-code findings")),
+    "mypy":       ("mypy",    lambda item: print_line_tool_details(item, "Type findings")),
+}
+
+
 def print_tool_outputs(report: Report):
     print(f"\n  {c(f'{BOLD}{WHITE}', '🧾 TOOL DETAILS')}")
     print(f"  {c(DIM, '─' * 68)}")
 
     for item in report.tool_outputs:
-        cmd = item["cmd"]
-        tool_name = tool_output_key(cmd)
-
-        if tool_name == "pylint":
-            print_tool_header("pylint", item)
-            print_pylint_details(item)
-        elif tool_name == "flake8":
-            print_tool_header("flake8", item)
-            print_flake8_details(item)
-        elif tool_name == "bandit":
-            print_tool_header("bandit", item)
-            print_bandit_details(item)
-        elif tool_name == "radon-cc":
-            print_tool_header("radon complexity", item)
-            print_radon_cc_details(item)
-        elif tool_name == "radon-mi":
-            print_tool_header("radon maintainability", item)
-            print_radon_mi_details(item)
-        elif tool_name == "radon-raw":
-            print_tool_header("radon raw metrics", item)
-            print_radon_raw_details(item)
-        elif tool_name == "vulture":
-            print_tool_header("vulture", item)
-            print_line_tool_details(item, "Dead-code findings")
-        elif tool_name == "mypy":
-            print_tool_header("mypy", item)
-            print_line_tool_details(item, "Type findings")
+        tool_name = tool_output_key(item["cmd"])
+        entry = TOOL_PRINTERS.get(tool_name)
+        if entry:
+            header, detail_fn = entry
+            print_tool_header(header, item)
+            detail_fn(item)
 
         if item["stderr"].strip():
             print("    Tool messages:")
@@ -1250,7 +2100,8 @@ def print_report(report: Report, verbose: bool = False):
 
     if not verbose:
         print(f"  {c(DIM, 'Run with -v for full issue details')}")
-    print(f"  {c(DIM, 'Powered by: pylint + flake8 + bandit + radon + vulture + mypy')}")
+    powered_by = "pylint + flake8 + ruff + prospector + bandit + semgrep + pydeps + radon + vulture + mypy"
+    print(f"  {c(DIM, f'Powered by: {powered_by}')}")
     print(c(f"{BOLD}{BLUE}", "═" * W))
     print()
 
@@ -1576,7 +2427,10 @@ def render_scoring_heuristics_markdown() -> str:
         findings produced by each tool.
 
         - `flake8`: derived from reported findings.
+        - `ruff`: derived from reported findings.
+        - `prospector`: derived from reported findings.
         - `bandit`: derived from reported findings.
+        - `semgrep`: derived from reported findings.
         - `vulture`: derived from reported findings.
         - `mypy`: derived from reported findings.
         - `radon`: derived from native metrics, using the average of:
@@ -1585,7 +2439,7 @@ def render_scoring_heuristics_markdown() -> str:
 
         ## Penalty Model
 
-        For `flake8`, `bandit`, `vulture`, and `mypy`, PyQuality computes:
+        For `flake8`, `ruff`, `prospector`, `bandit`, `semgrep`, `vulture`, and `mypy`, PyQuality computes:
 
         - `score = max(0, min(100, 100 - total_penalty))`
         - `total_penalty = sum(penalty_for_each_finding)`
@@ -1603,6 +2457,39 @@ def render_scoring_heuristics_markdown() -> str:
         - `C9*` -> `MEDIUM`
         - `E*` and `W*` -> `LOW`
 
+        ### ruff penalties
+
+        - `CRITICAL`: 25
+        - `HIGH`: 12
+        - `MEDIUM`: 5
+        - `LOW`: 2
+        - `INFO`: 1
+
+        Severity mapping used by PyQuality:
+
+        - `S*` -> `HIGH` / `Security`
+        - `F*`, `B*`, `BLE*`, `PLE*`, `PLC*`, and `E9*` -> `HIGH` / `Bug`
+        - `C90*` and `PLR09*` -> `MEDIUM` / `Complexity`
+        - `E*`, `W*`, and `I*` -> `LOW` / `Style`
+        - all other Ruff rules -> `MEDIUM` / `Code Smell`
+
+        ### prospector penalties
+
+        - `CRITICAL`: 25
+        - `HIGH`: 12
+        - `MEDIUM`: 5
+        - `LOW`: 2
+        - `INFO`: 1
+
+        Severity mapping used by PyQuality:
+
+        - `bandit` and `dodgy` messages -> `Security`
+        - `mccabe` messages -> `Complexity`
+        - `mypy` and `pyright` messages -> `Type Error`
+        - `vulture` messages -> `Dead Code`
+        - `pyflakes` and pylint `E/F` messages -> `Bug`
+        - `pydocstyle`, `pycodestyle`, and pylint `C/R` messages -> convention/style smell bands
+
         ### bandit penalties
 
         - `CRITICAL`: 35
@@ -1615,6 +2502,20 @@ def render_scoring_heuristics_markdown() -> str:
         - Bandit `HIGH` -> PyQuality `CRITICAL`
         - Bandit `MEDIUM` -> PyQuality `HIGH`
         - Bandit `LOW` -> PyQuality `MEDIUM`
+
+        ### semgrep penalties
+
+        - `CRITICAL`: 35
+        - `HIGH`: 18
+        - `MEDIUM`: 8
+        - `LOW`: 3
+
+        Severity mapping used by PyQuality:
+
+        - Semgrep `ERROR` -> `HIGH`
+        - Semgrep `WARNING` -> `MEDIUM`
+        - Semgrep `INFO` -> `LOW`
+        - security findings with `impact=HIGH` and `confidence=HIGH` -> `CRITICAL`
 
         ### vulture penalties
 
@@ -1765,7 +2666,6 @@ def write_reports(report: Report, reports_dir: str) -> Path:
         )
 
     return report_root
-    print(json.dumps(result, indent=2))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1891,6 +2791,8 @@ def run_analysis_from_args(args) -> None:
         args.path,
         skip_mypy=args.skip_mypy,
         show_progress=not args.json,
+        semgrep_config=args.semgrep_config,
+        prospector_strictness=args.prospector_strictness,
     )
     if args.reports_dir:
         write_reports(report, args.reports_dir)
@@ -1920,7 +2822,10 @@ def main():
             Tools orchestrated:
               pylint     Linting, code smells, conventions
               flake8     PEP 8 style + pyflakes errors
+              ruff       Fast Python lint aggregation
+              prospector Aggregated Python static analysis
               bandit     Security vulnerability scanning
+              semgrep    Pattern-based bug and security scanning
               radon      Cyclomatic complexity & maintainability
               vulture    Dead code detection
               mypy       Static type checking
@@ -1931,6 +2836,10 @@ def main():
               pyquality app.py --json       JSON output for CI pipelines
               pyquality src/ -t B           Fail if grade drops below B
               pyquality src/ --skip-mypy    Skip type checking (faster)
+              pyquality src/ --prospector-strictness high
+                                          Make Prospector stricter
+              pyquality src/ --semgrep-config rules/semgrep.yml
+                                          Override the bundled local Semgrep rules
               pyquality . --reports-dir docs/quality
                                           Export markdown/html/json reports
         """)
@@ -1948,6 +2857,11 @@ def main():
                         help="Skip mypy type checking (faster)")
     parser.add_argument("--reports-dir", default=None,
                         help="Write detailed report artifacts to a directory")
+    parser.add_argument("--prospector-strictness", default=os.environ.get("PYQUALITY_PROSPECTOR_STRICTNESS", "medium"),
+                        choices=["verylow", "low", "medium", "high", "veryhigh"],
+                        help="Prospector strictness level (default: medium)")
+    parser.add_argument("--semgrep-config", default=os.environ.get("PYQUALITY_SEMGREP_CONFIG"),
+                        help="Semgrep config path (default: bundled local rules)")
 
     args = parser.parse_args()
 
